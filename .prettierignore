@@ -1,14 +1,12 @@
 # ignore everything by default
-/*
+# /*
 # Enable prettier for apps, dapps and sdk
 !/apps
-!/sdk
 !/dapps
 !/.config
 !/*.js
 
 # ignore generated files
-/apps/icons/src
 npm-debug.log*
 package-lock.json
 yarn-debug.log*
@@ -18,8 +16,8 @@ build/
 coverage/
 dist/
 out/
+generated/
 playwright-report/
 storybook-static/
-sdk/wallet-adapter/site/pages/
 CHANGELOG.md
 

@@ -13,16 +13,11 @@ use std::time::Duration;
 use typed_store::metrics::SamplingInterval;
 use typed_store::rocks::list_tables;
 use typed_store::rocks::DBMap;
-use typed_store::rocks::RocksDBAccessType;
 use typed_store::rocks::{be_fix_int_ser, MetricConf};
-use typed_store::sally::SallyColumn;
-use typed_store::sally::SallyDBOptions;
-use typed_store::sally::SallyReadOnlyDBOptions;
 use typed_store::traits::Map;
 use typed_store::traits::TableSummary;
 use typed_store::traits::TypedStoreDebug;
-use typed_store_derive::DBMapUtils;
-use typed_store_derive::SallyDB;
+use typed_store::DBMapUtils;
 
 fn temp_dir() -> std::path::PathBuf {
     tempfile::tempdir()
@@ -46,6 +41,17 @@ struct TablesGenerics<Q, W> {
 pub struct Generic<T, V> {
     field1: T,
     field2: V,
+}
+
+#[derive(DBMapUtils)]
+struct RenameTables1 {
+    table: DBMap<String, String>,
+}
+
+#[derive(DBMapUtils)]
+struct RenameTables2 {
+    #[rename = "table"]
+    renamed_table: DBMap<String, String>,
 }
 
 impl<
@@ -155,100 +161,66 @@ async fn macro_test() {
     // Test pagination
     let m = tbls_secondary.dump("table1", 2, 0).unwrap();
     assert_eq!(2, m.len());
-    assert_eq!(format!("\"1\""), *m.get(&"\"1\"".to_string()).unwrap());
-    assert_eq!(format!("\"2\""), *m.get(&"\"2\"".to_string()).unwrap());
+    assert_eq!(format!("\"1\""), *m.get("\"1\"").unwrap());
+    assert_eq!(format!("\"2\""), *m.get("\"2\"").unwrap());
 
     let m = tbls_secondary.dump("table1", 3, 2).unwrap();
     assert_eq!(3, m.len());
-    assert_eq!(format!("\"7\""), *m.get(&"\"7\"".to_string()).unwrap());
-    assert_eq!(format!("\"8\""), *m.get(&"\"8\"".to_string()).unwrap());
-}
-
-#[derive(SallyDB)]
-pub struct SallyDBExample {
-    col1: SallyColumn<String, String>,
-    col2: SallyColumn<i32, String>,
+    assert_eq!(format!("\"7\""), *m.get("\"7\"").unwrap());
+    assert_eq!(format!("\"8\""), *m.get("\"8\"").unwrap());
 }
 
 #[tokio::test]
-async fn test_sallydb() {
-    let primary_path = temp_dir();
-    let example_db = SallyDBExample::init(SallyDBOptions::RocksDB((
-        primary_path.clone(),
-        MetricConf::default(),
-        RocksDBAccessType::Primary,
-        None,
-        None,
-    )));
+async fn rename_test() {
+    let dbdir = temp_dir();
 
-    // Write to both columns
-    let keys_vals_1 = (1..10).map(|i| (i.to_string(), i.to_string()));
-    let mut wb = example_db.col1.batch();
-    wb.insert_batch(&example_db.col1, keys_vals_1.clone())
-        .expect("Failed to insert");
+    let key = "key".to_string();
+    let value = "value".to_string();
+    {
+        let original_db =
+            RenameTables1::open_tables_read_write(dbdir.clone(), MetricConf::default(), None, None);
+        original_db.table.insert(&key, &value).unwrap();
+    }
 
-    let keys_vals_2 = (3..10).map(|i| (i, i.to_string()));
-    wb.insert_batch(&example_db.col2, keys_vals_2.clone())
-        .expect("Failed to insert");
+    // sleep for 1 second
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
-    wb.write().await.expect("Failed to commit write batch");
+    {
+        let renamed_db =
+            RenameTables2::open_tables_read_write(dbdir.clone(), MetricConf::default(), None, None);
+        assert_eq!(renamed_db.renamed_table.get(&key), Ok(Some(value)));
+    }
+}
 
-    // Open in secondary mode
-    let example_db_secondary =
-        SallyDBExample::get_read_only_handle(SallyReadOnlyDBOptions::RocksDB(Box::new((
-            primary_path.clone(),
+#[derive(DBMapUtils)]
+struct DeprecatedTables {
+    table1: DBMap<String, String>,
+    #[deprecated]
+    table2: DBMap<i32, String>,
+}
+
+#[tokio::test]
+async fn deprecate_test() {
+    let dbdir = temp_dir();
+    let key = "key".to_string();
+    let value = "value".to_string();
+    {
+        let original_db =
+            Tables::open_tables_read_write(dbdir.clone(), MetricConf::default(), None, None);
+        original_db.table1.insert(&key, &value).unwrap();
+        original_db.table2.insert(&0, &value).unwrap();
+    }
+    for _ in 0..2 {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let db = DeprecatedTables::open_tables_read_write_with_deprecation_option(
+            dbdir.clone(),
             MetricConf::default(),
             None,
             None,
-        ))));
-
-    // Check all the tables can be listed
-    let actual_table_names: HashSet<_> = list_tables(primary_path).unwrap().into_iter().collect();
-    let observed_table_names: HashSet<_> = SallyDBExample::describe_tables()
-        .iter()
-        .map(|q| q.0.clone())
-        .collect();
-
-    let exp: HashSet<String> =
-        HashSet::from_iter(vec!["col1", "col2"].into_iter().map(|s| s.to_owned()));
-    assert_eq!(HashSet::from_iter(actual_table_names), exp);
-    assert_eq!(HashSet::from_iter(observed_table_names), exp);
-
-    // Check the counts
-    assert_eq!(9, example_db_secondary.count_keys("col1").unwrap());
-    assert_eq!(7, example_db_secondary.count_keys("col2").unwrap());
-
-    // Test all entries
-    let m = example_db_secondary.dump("col1", 100, 0).unwrap();
-    for (k, v) in keys_vals_1 {
-        assert_eq!(format!("\"{v}\""), *m.get(&format!("\"{k}\"")).unwrap());
+            true,
+        );
+        assert_eq!(db.table1.get(&key), Ok(Some(value.clone())));
     }
-
-    let m = example_db_secondary.dump("col2", 100, 0).unwrap();
-    for (k, v) in keys_vals_2 {
-        assert_eq!(format!("\"{v}\""), *m.get(&k.to_string()).unwrap());
-    }
-
-    // Check that catchup logic works
-    let keys_vals_1 = (100..110).map(|i| (i.to_string(), i.to_string()));
-    let mut wb = example_db.col1.batch();
-    wb.insert_batch(&example_db.col1, keys_vals_1.clone())
-        .expect("Failed to insert");
-    wb.write().await.expect("Failed to commit write batch");
-
-    // New entries should be present in secondary
-    assert_eq!(19, example_db_secondary.count_keys("col1").unwrap());
-
-    // Test pagination
-    let m = example_db_secondary.dump("col1", 2, 0).unwrap();
-    assert_eq!(2, m.len());
-    assert_eq!(format!("\"1\""), *m.get(&"\"1\"".to_string()).unwrap());
-    assert_eq!(format!("\"2\""), *m.get(&"\"2\"".to_string()).unwrap());
-
-    let m = example_db_secondary.dump("col1", 3, 2).unwrap();
-    assert_eq!(3, m.len());
-    assert_eq!(format!("\"7\""), *m.get(&"\"7\"".to_string()).unwrap());
-    assert_eq!(format!("\"8\""), *m.get(&"\"8\"".to_string()).unwrap());
 }
 
 #[tokio::test]
